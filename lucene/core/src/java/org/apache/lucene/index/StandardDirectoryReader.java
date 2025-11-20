@@ -18,6 +18,7 @@ package org.apache.lucene.index;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -94,6 +95,16 @@ public final class StandardDirectoryReader extends DirectoryReader {
                 new SegmentReader(
                     sis.info(i), sis.getIndexCreatedVersionMajor(), IOContext.DEFAULT);
           }
+          Arrays.parallelSetAll(
+              readers,
+              i -> {
+                try {
+                  return new SegmentReader(
+                      sis.info(i), sis.getIndexCreatedVersionMajor(), IOContext.DEFAULT);
+                } catch (IOException e) {
+                  throw new UncheckedIOException(e);
+                }
+              });
           // This may throw CorruptIndexException if there are too many docs, so
           // it must be inside try clause so we close readers in that case:
           DirectoryReader reader =

@@ -1,35 +1,24 @@
-# Gradle.
-# Ignore the generated local settings file.
-/gradle.properties
-/build-options.local.properties
-.gradle/
-build/
-
-# Ignore gradle wrapper jar.
-gradle/wrapper/gradle-wrapper.jar
-
-# IntelliJ IDEA
-/.idea/
-#    IntelliJ creates this folder, ignore.
-/dev-tools/missing-doclet/out/
-
-# Eclipse
-/.project
-/.classpath
-/.settings/
-
-# Eclipse Gradle oddity
-**/bin/default/
-
-# macOS
+.jxta/
 .DS_Store
+.classpath
+.project
+.settings/
+.gradle/
+target/
+lib_*/
+build/
+log
+*.log
+*.rrd
+/bin/
+*.class
+lib.jar
+generatePackage/
+!**/archive/**
+!**/archives/**
+.*.*
+META-INF
 
-# Python
-.pydevproject
-__pycache__
-
-# Emacs backup
-*~
-
-# SDKMAN
-.sdkmanrc
+node_modules
+package.json
+package-lock.json
