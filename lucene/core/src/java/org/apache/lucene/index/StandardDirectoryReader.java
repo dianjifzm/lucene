@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.stream.IntStream;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
@@ -134,26 +135,31 @@ public final class StandardDirectoryReader extends DirectoryReader {
     final Directory dir = writer.getDirectory();
 
     final SegmentInfos segmentInfos = infos.clone();
-    int infosUpto = 0;
     try {
-      for (int i = 0; i < numSegments; i++) {
-        // NOTE: important that we use infos not
-        // segmentInfos here, so that we are passing the
-        // actual instance of SegmentInfoPerCommit in
-        // IndexWriter's segmentInfos:
-        final SegmentCommitInfo info = infos.info(i);
-        assert info.info.dir == dir;
-        final SegmentReader reader = readerFunction.apply(info);
-        if (reader.numDocs() > 0
-            || writer.getConfig().mergePolicy.keepFullyDeletedSegment(() -> reader)) {
-          // Steal the ref:
-          readers.add(reader);
-          infosUpto++;
-        } else {
-          reader.decRef();
-          segmentInfos.remove(infosUpto);
-        }
-      }
+      IntStream.range(0, numSegments)
+          .parallel()
+          .forEach(
+              i -> {
+                try {
+                  // NOTE: important that we use infos not
+                  // segmentInfos here, so that we are passing the
+                  // actual instance of SegmentInfoPerCommit in
+                  // IndexWriter's segmentInfos:
+                  final SegmentCommitInfo info = infos.info(i);
+                  assert info.info.dir == dir;
+                  final SegmentReader reader = readerFunction.apply(info);
+                  if (reader.numDocs() > 0
+                      || writer.getConfig().mergePolicy.keepFullyDeletedSegment(() -> reader)) {
+                    // Steal the ref:
+                    readers.add(reader);
+                  } else {
+                    reader.decRef();
+                    segmentInfos.remove(i);
+                  }
+                } catch (IOException e) {
+                  throw new UncheckedIOException(e);
+                }
+              });
 
       writer.incRefDeleter(segmentInfos);
 
@@ -192,7 +198,7 @@ public final class StandardDirectoryReader extends DirectoryReader {
 
     // we put the old SegmentReaders in a map, that allows us
     // to lookup a reader using its segment name
-    Map<String, Integer> segmentReaders = Collections.emptyMap();
+    final Map<String, Integer> segmentReaders;
 
     if (oldReaders != null) {
       segmentReaders = CollectionUtil.newHashMap(oldReaders.size());
@@ -201,114 +207,131 @@ public final class StandardDirectoryReader extends DirectoryReader {
         final SegmentReader sr = (SegmentReader) oldReaders.get(i);
         segmentReaders.put(sr.getSegmentName(), Integer.valueOf(i));
       }
+    } else {
+      segmentReaders = Collections.emptyMap();
     }
 
     SegmentReader[] newReaders = new SegmentReader[infos.size()];
-    for (int i = infos.size() - 1; i >= 0; i--) {
-      SegmentCommitInfo commitInfo = infos.info(i);
 
-      // find SegmentReader for this segment
-      Integer oldReaderIndex = segmentReaders.get(commitInfo.info.name);
-      SegmentReader oldReader;
-      if (oldReaderIndex == null) {
-        // this is a new segment, no old SegmentReader can be reused
-        oldReader = null;
-      } else {
-        // there is an old reader for this segment - we'll try to reopen it
-        oldReader = (SegmentReader) oldReaders.get(oldReaderIndex.intValue());
-      }
+    IntStream.range(0, newReaders.length) //
+        .parallel() //
+        .forEach(
+            i -> {
+              try {
 
-      // Make a best effort to detect when the app illegally "rm -rf" their
-      // index while a reader was open, and then called openIfChanged:
-      if (oldReader != null
-          && Arrays.equals(commitInfo.info.getId(), oldReader.getSegmentInfo().info.getId())
-              == false) {
-        throw new IllegalStateException(
-            "same segment "
-                + commitInfo.info.name
-                + " has invalid doc count change; likely you are re-opening a reader after illegally removing index files yourself and building a new index in their place.  Use IndexWriter.deleteAll or open a new IndexWriter using OpenMode.CREATE instead");
-      }
+                SegmentCommitInfo commitInfo = infos.info(i);
 
-      boolean success = false;
-      try {
-        SegmentReader newReader;
-        if (oldReader == null
-            || commitInfo.info.getUseCompoundFile()
-                != oldReader.getSegmentInfo().info.getUseCompoundFile()) {
-          // this is a new reader; in case we hit an exception we can decRef it safely
-          newReader =
-              new SegmentReader(commitInfo, infos.getIndexCreatedVersionMajor(), IOContext.DEFAULT);
-          newReaders[i] = newReader;
-        } else {
-          if (oldReader.isNRT) {
-            // We must load liveDocs/DV updates from disk:
-            Bits liveDocs =
-                commitInfo.hasDeletions()
-                    ? commitInfo
-                        .info
-                        .getCodec()
-                        .liveDocsFormat()
-                        .readLiveDocs(commitInfo.info.dir, commitInfo, IOContext.READONCE)
-                    : null;
-            newReaders[i] =
-                new SegmentReader(
-                    commitInfo,
-                    oldReader,
-                    liveDocs,
-                    liveDocs,
-                    commitInfo.info.maxDoc() - commitInfo.getDelCount(),
-                    false);
-          } else {
-            if (oldReader.getSegmentInfo().getDelGen() == commitInfo.getDelGen()
-                && oldReader.getSegmentInfo().getFieldInfosGen() == commitInfo.getFieldInfosGen()) {
-              // No change; this reader will be shared between
-              // the old and the new one, so we must incRef
-              // it:
-              oldReader.incRef();
-              newReaders[i] = oldReader;
-            } else {
-              // Steal the ref returned by SegmentReader ctor:
-              assert commitInfo.info.dir == oldReader.getSegmentInfo().info.dir;
+                // find SegmentReader for this segment
+                Integer oldReaderIndex = segmentReaders.get(commitInfo.info.name);
+                SegmentReader oldReader;
+                if (oldReaderIndex == null) {
+                  // this is a new segment, no old SegmentReader can be reused
+                  oldReader = null;
+                } else {
+                  // there is an old reader for this segment - we'll try to reopen it
+                  oldReader = (SegmentReader) oldReaders.get(oldReaderIndex.intValue());
+                }
 
-              if (oldReader.getSegmentInfo().getDelGen() == commitInfo.getDelGen()) {
-                // only DV updates
-                newReaders[i] =
-                    new SegmentReader(
-                        commitInfo,
-                        oldReader,
-                        oldReader.getLiveDocs(),
-                        oldReader.getHardLiveDocs(),
-                        oldReader.numDocs(),
-                        false); // this is not an NRT reader!
-              } else {
-                // both DV and liveDocs have changed
-                Bits liveDocs =
-                    commitInfo.hasDeletions()
-                        ? commitInfo
-                            .info
-                            .getCodec()
-                            .liveDocsFormat()
-                            .readLiveDocs(commitInfo.info.dir, commitInfo, IOContext.READONCE)
-                        : null;
-                newReaders[i] =
-                    new SegmentReader(
-                        commitInfo,
-                        oldReader,
-                        liveDocs,
-                        liveDocs,
-                        commitInfo.info.maxDoc() - commitInfo.getDelCount(),
-                        false);
+                // Make a best effort to detect when the app illegally "rm -rf" their
+                // index while a reader was open, and then called openIfChanged:
+                if (oldReader != null
+                    && Arrays.equals(
+                            commitInfo.info.getId(), oldReader.getSegmentInfo().info.getId())
+                        == false) {
+                  throw new IllegalStateException(
+                      "same segment "
+                          + commitInfo.info.name
+                          + " has invalid doc count change; likely you are re-opening a reader after illegally removing index files yourself and building a new index in their place.  Use IndexWriter.deleteAll or open a new IndexWriter using OpenMode.CREATE instead");
+                }
+
+                boolean success = false;
+                try {
+                  SegmentReader newReader;
+                  if (oldReader == null
+                      || commitInfo.info.getUseCompoundFile()
+                          != oldReader.getSegmentInfo().info.getUseCompoundFile()) {
+                    // this is a new reader; in case we hit an exception we can decRef it safely
+                    newReader =
+                        new SegmentReader(
+                            commitInfo, infos.getIndexCreatedVersionMajor(), IOContext.DEFAULT);
+                    newReaders[i] = newReader;
+                  } else {
+                    if (oldReader.isNRT) {
+                      // We must load liveDocs/DV updates from disk:
+                      Bits liveDocs =
+                          commitInfo.hasDeletions()
+                              ? commitInfo
+                                  .info
+                                  .getCodec()
+                                  .liveDocsFormat()
+                                  .readLiveDocs(commitInfo.info.dir, commitInfo, IOContext.READONCE)
+                              : null;
+                      newReaders[i] =
+                          new SegmentReader(
+                              commitInfo,
+                              oldReader,
+                              liveDocs,
+                              liveDocs,
+                              commitInfo.info.maxDoc() - commitInfo.getDelCount(),
+                              false);
+                    } else {
+                      if (oldReader.getSegmentInfo().getDelGen() == commitInfo.getDelGen()
+                          && oldReader.getSegmentInfo().getFieldInfosGen()
+                              == commitInfo.getFieldInfosGen()) {
+                        // No change; this reader will be shared between
+                        // the old and the new one, so we must incRef
+                        // it:
+                        oldReader.incRef();
+                        newReaders[i] = oldReader;
+                      } else {
+                        // Steal the ref returned by SegmentReader ctor:
+                        assert commitInfo.info.dir == oldReader.getSegmentInfo().info.dir;
+
+                        if (oldReader.getSegmentInfo().getDelGen() == commitInfo.getDelGen()) {
+                          // only DV updates
+                          newReaders[i] =
+                              new SegmentReader(
+                                  commitInfo,
+                                  oldReader,
+                                  oldReader.getLiveDocs(),
+                                  oldReader.getHardLiveDocs(),
+                                  oldReader.numDocs(),
+                                  false); // this is not an NRT reader!
+                        } else {
+                          // both DV and liveDocs have changed
+                          Bits liveDocs =
+                              commitInfo.hasDeletions()
+                                  ? commitInfo
+                                      .info
+                                      .getCodec()
+                                      .liveDocsFormat()
+                                      .readLiveDocs(
+                                          commitInfo.info.dir, commitInfo, IOContext.READONCE)
+                                  : null;
+                          newReaders[i] =
+                              new SegmentReader(
+                                  commitInfo,
+                                  oldReader,
+                                  liveDocs,
+                                  liveDocs,
+                                  commitInfo.info.maxDoc() - commitInfo.getDelCount(),
+                                  false);
+                        }
+                      }
+                    }
+                  }
+                  success = true;
+                } finally {
+                  if (!success) {
+                    decRefWhileHandlingException(newReaders);
+                  }
+                }
+
+              } catch (IOException e) {
+                throw new UncheckedIOException(e);
               }
-            }
-          }
-        }
-        success = true;
-      } finally {
-        if (!success) {
-          decRefWhileHandlingException(newReaders);
-        }
-      }
-    }
+            });
+
     return new StandardDirectoryReader(
         directory, newReaders, null, infos, leafSorter, false, false);
   }
